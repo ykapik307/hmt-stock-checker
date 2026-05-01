@@ -17,6 +17,8 @@ PRODUCTS = [
     },
     {
         "name": "HMT Sangam MGSS 05 (hmtwatches.in)",
+        # hmtwatches.in uses session-based URLs that expire, so we scan
+        # the full listing page and search for the model name instead.
         "url": "https://www.hmtwatches.in/watches",
         "site": "official",
     },
@@ -38,20 +40,90 @@ HEADERS = {
 
 
 def check_store_site(product: dict) -> tuple[bool, str]:
+    """
+    Checks hmtwatches.store product page.
+
+    The page structure when OUT OF STOCK:
+      <product section>  →  "Out of Stock"  (no Add to Cart button here)
+      <you may also like> → "ADD TO CART" / "BUY NOW" for OTHER products
+
+    Fix: only look at the product detail section, not the whole page.
+    We find "Out of Stock" near the price, and only trust "Add to Cart"
+    if it appears in that same section — not in "You May Also Like".
+    """
     resp = requests.get(product["url"], headers=HEADERS, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
-    page_text = soup.get_text(separator=" ").lower()
 
-    out_of_stock = "out of stock" in page_text
-    add_to_cart  = "add to cart"  in page_text
+    # Strategy: find the price element (₹2765) — the stock status
+    # is always nearby. Then check only that local section.
+    in_stock = False
 
-    in_stock = (not out_of_stock) or add_to_cart
-    print(f"  [store]    out_of_stock={out_of_stock}  add_to_cart={add_to_cart}  → in_stock={in_stock}")
+    # Look for the "Out of Stock" text that sits right next to the price
+    # The page shows it as plain text directly under the price/colour row.
+    out_of_stock_tags = soup.find_all(
+        string=lambda t: t and "out of stock" in t.strip().lower()
+    )
+
+    # Filter to tags that are NOT inside "You May Also Like" section
+    relevant_oos = []
+    for tag in out_of_stock_tags:
+        # Walk up and check if any ancestor contains "you may also like"
+        in_recommendations = False
+        parent = tag.find_parent()
+        for _ in range(10):
+            if parent is None:
+                break
+            txt = parent.get_text(separator=" ").lower()
+            if "you may also like" in txt and len(txt) > 500:
+                in_recommendations = True
+                break
+            parent = parent.find_parent()
+        if not in_recommendations:
+            relevant_oos.append(tag)
+
+    if relevant_oos:
+        # "Out of Stock" found in the product section itself
+        print(f"  [store]    'Out of Stock' found in product section → out of stock")
+        return False, product["url"]
+
+    # No "Out of Stock" in the product section — now check for Add to Cart
+    # but again, only in the product section (not recommendations)
+    add_to_cart_tags = soup.find_all(
+        string=lambda t: t and "add to cart" in t.strip().lower()
+    )
+    relevant_atc = []
+    for tag in add_to_cart_tags:
+        in_recommendations = False
+        parent = tag.find_parent()
+        for _ in range(10):
+            if parent is None:
+                break
+            txt = parent.get_text(separator=" ").lower()
+            if "you may also like" in txt and len(txt) > 500:
+                in_recommendations = True
+                break
+            parent = parent.find_parent()
+        if not in_recommendations:
+            relevant_atc.append(tag)
+
+    if relevant_atc:
+        print(f"  [store]    'Add to Cart' found in product section → IN STOCK")
+        in_stock = True
+    else:
+        # Neither out-of-stock nor add-to-cart in product section
+        # Treat as still out of stock (safer default)
+        print(f"  [store]    No clear stock signal in product section → assuming out of stock")
+        in_stock = False
+
     return in_stock, product["url"]
 
 
 def check_official_site(product: dict) -> tuple[bool, str]:
+    """
+    Checks hmtwatches.in listing page for the model name.
+    Looks for the product card and checks its stock status.
+    """
     resp = requests.get(product["url"], headers=HEADERS, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -60,23 +132,24 @@ def check_official_site(product: dict) -> tuple[bool, str]:
 
     if not model_tag:
         print(f"  [official] '{SEARCH_MODEL}' not found on listing page → out of stock")
-        return False, product["url"]
+        return False, "https://www.hmtwatches.in/watches"
 
+    # Walk up to find the product card and check stock status within it
     parent = model_tag.find_parent()
-    for _ in range(6):
+    for _ in range(8):
         if parent is None:
             break
         card_text = parent.get_text(separator=" ").lower()
         if "out of stock" in card_text:
             print(f"  [official] '{SEARCH_MODEL}' found but marked out of stock")
-            return False, product["url"]
+            return False, "https://www.hmtwatches.in/watches"
         if "add to cart" in card_text or "buy now" in card_text:
             print(f"  [official] '{SEARCH_MODEL}' found and appears available!")
-            return True, product["url"]
+            return True, "https://www.hmtwatches.in/watches"
         parent = parent.find_parent()
 
-    print(f"  [official] '{SEARCH_MODEL}' found, stock unclear → flagging as available")
-    return True, product["url"]
+    print(f"  [official] '{SEARCH_MODEL}' found but stock status unclear → assuming out of stock")
+    return False, "https://www.hmtwatches.in/watches"
 
 
 def check_product(product: dict) -> tuple[bool, str]:
