@@ -1,41 +1,36 @@
 """
 HMT Watch Stock Checker
-Monitors HMT Sangam MGSS 05 variants across TWO websites and sends
-a Telegram alert the moment any variant becomes available.
-
-hmtwatches.store → direct product page per colour variant
-hmtwatches.in   → one search query returning all 6 variants at once
+Monitors HMT Sangam MGSS 05 (Maroon, Grey, Blue) on hmtwatches.store
+and sends a Telegram alert the moment any variant becomes available.
 """
 
 import os
-import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
-
-# Direct product pages on hmtwatches.store
 STORE_PRODUCTS = [
     {
-        "name": "HMT Sangam MGSS 05 Maroon — hmtwatches.store",
+        "name": "HMT Sangam MGSS 05 Maroon",
         "url": "https://www.hmtwatches.store/product/92eec23b-13cd-4191-afab-2cc0ddd8722f",
     },
     {
-        "name": "HMT Sangam MGSS 05 Grey — hmtwatches.store",
+        "name": "HMT Sangam MGSS 05 Grey",
         "url": "https://www.hmtwatches.store/product/0ac2f002-7d19-49a9-a8b6-7edf5650a8c6",
     },
     {
-        "name": "HMT Sangam MGSS 05 Blue — hmtwatches.store",
+        "name": "HMT Sangam MGSS 05 Blue",
         "url": "https://www.hmtwatches.store/product/03c72bca-7137-4e09-9fdb-d953ee8261f1",
     },
 ]
 
-# hmtwatches.in homepage — Newly Listed section is server-side rendered
-# If a Sangam watch is restocked it appears here before anywhere else
-OFFICIAL_HOME_URL = "https://www.hmtwatches.in/"
-
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+
+# Reddit monitoring
+SUBREDDIT        = "hmtwatches"
+REDDIT_KEYWORDS  = ["sangam"]          # alert if any of these appear in title/body
+REDDIT_POST_SEEN_FILE = "seen_posts.txt"  # committed to repo to persist across runs
 # ───────────────────────────────────────────────────────────────────────────
 
 HEADERS = {
@@ -50,7 +45,8 @@ HEADERS = {
 def check_store_product(product: dict) -> tuple[bool, str]:
     """
     Checks a hmtwatches.store product page directly.
-    Only reads the product section — ignores 'You May Also Like' cards.
+    Only reads the product section — ignores 'You May Also Like' cards
+    which also have Add to Cart buttons for other products.
     """
     resp = requests.get(product["url"], headers=HEADERS, timeout=20)
     resp.raise_for_status()
@@ -67,125 +63,94 @@ def check_store_product(product: dict) -> tuple[bool, str]:
             parent = parent.find_parent()
         return False
 
+    # Check for Out of Stock in product section only
     oos_tags = [
         t for t in soup.find_all(string=lambda t: t and "out of stock" in t.strip().lower())
         if not in_recommendations(t)
     ]
     if oos_tags:
-        print(f"  [store] 'Out of Stock' found → out of stock")
+        print("  [store] 'Out of Stock' found in product section → out of stock")
         return False, product["url"]
 
+    # Check for Add to Cart in product section only
     atc_tags = [
         t for t in soup.find_all(string=lambda t: t and "add to cart" in t.strip().lower())
         if not in_recommendations(t)
     ]
     if atc_tags:
-        print(f"  [store] 'Add to Cart' found → IN STOCK!")
+        print("  [store] 'Add to Cart' found in product section → IN STOCK!")
         return True, product["url"]
 
-    print(f"  [store] No clear stock signal → assuming out of stock")
+    print("  [store] No clear stock signal → assuming out of stock")
     return False, product["url"]
 
 
-def check_official_site() -> list[tuple[str, str]]:
+REDDIT_HEADERS = {
+    # Reddit requires a descriptive User-Agent for API access
+    "User-Agent": "hmt-stock-checker/1.0 (by /u/hmt_stock_bot)"
+}
+
+
+def load_seen_posts() -> set:
+    """Load post IDs we've already alerted on to avoid duplicate alerts."""
+    try:
+        with open(REDDIT_POST_SEEN_FILE, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
+
+
+def save_seen_posts(seen: set):
+    """Persist seen post IDs. Keep only last 200 to avoid unbounded growth."""
+    ids = list(seen)[-200:]
+    with open(REDDIT_POST_SEEN_FILE, "w") as f:
+        f.write("\n".join(ids))
+
+
+def check_reddit() -> list[tuple[str, str, str]]:
     """
-    Checks the hmtwatches.in homepage Newly Listed section.
-    This section is fully server-rendered — no JS needed.
-    If any Sangam MGSS 05 watch appears here without Out of Stock label,
-    it means it just got restocked.
+    Fetches the 25 newest posts from r/hmtwatches via Reddit's public JSON API.
+    Returns list of (title, url, post_id) for posts mentioning Sangam
+    that we haven't alerted on before.
     """
-    resp = requests.get(OFFICIAL_HOME_URL, headers=HEADERS, timeout=20)
+    url = f"https://www.reddit.com/r/{SUBREDDIT}/new.json?limit=25"
+    resp = requests.get(url, headers=REDDIT_HEADERS, timeout=20)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    data = resp.json()
 
-    # Find all product links on the homepage
-    all_links = soup.find_all("a", href=lambda h: h and "product_overview" in h)
+    posts = data.get("data", {}).get("children", [])
+    print(f"  [reddit] Fetched {len(posts)} latest posts from r/{SUBREDDIT}")
 
-    if not all_links:
-        print(f"  [official] No product links found on homepage — skipping safely")
-        return []
+    seen = load_seen_posts()
+    matches = []
 
-    print(f"  [official] Homepage loaded with {len(all_links)} product card(s) ✓")
+    for post in posts:
+        p = post.get("data", {})
+        post_id   = p.get("id", "")
+        title     = p.get("title", "")
+        selftext  = p.get("selftext", "")
+        permalink = "https://www.reddit.com" + p.get("permalink", "")
 
-    in_stock_items = []
-    seen_urls = set()
+        combined = (title + " " + selftext).lower()
 
-    for link in all_links:
-        product_url = link["href"]
-        if not product_url.startswith("http"):
-            product_url = "https://www.hmtwatches.in" + product_url
-        if product_url in seen_urls:
-            continue
-        seen_urls.add(product_url)
-
-        product_name = link.get_text(strip=True)
-        if not product_name:
+        keyword_found = any(kw.lower() in combined for kw in REDDIT_KEYWORDS)
+        if not keyword_found:
             continue
 
-        # Only care about Sangam MGSS 05 watches
-        if "sangam" not in product_name.lower() and "mgss 05" not in product_name.lower():
+        if post_id in seen:
+            print(f"  [reddit] Already alerted: '{title[:60]}'")
             continue
 
-        # Walk up to find the card container with stock info
-        card = link.find_parent()
-        for _ in range(6):
-            if card is None:
-                break
-            if len(card.get_text(separator=" ")) > 80:
-                break
-            card = card.find_parent()
+        print(f"  [reddit] New Sangam mention: '{title[:60]}'")
+        matches.append((title, permalink, post_id))
 
-        if card is None:
-            continue
+    # Mark all new matches as seen
+    for _, _, post_id in matches:
+        seen.add(post_id)
+    if matches:
+        save_seen_posts(seen)
 
-        card_text = card.get_text(separator=" ").lower()
-        is_oos = "out of stock" in card_text or "out of  stock" in card_text
-
-        if is_oos:
-            print(f"    → {product_name}: out of stock")
-        else:
-            print(f"    → {product_name}: ✅ IN STOCK (appeared on homepage)!")
-            in_stock_items.append((product_name, product_url))
-
-    # ── Log ALL watches currently shown on homepage ──────────────
-    print("")
-    print("  📋 All watches currently on homepage:")
-    logged = set()
-    for link in all_links:
-        name = link.get_text(strip=True)
-        if not name or name in logged:
-            continue
-        logged.add(name)
-
-        card = link.find_parent()
-        for _ in range(6):
-            if card is None:
-                break
-            if len(card.get_text(separator=" ")) > 80:
-                break
-            card = card.find_parent()
-
-        stock = "unknown"
-        if card:
-            card_text = card.get_text(separator=" ").lower()
-            if "out of stock" in card_text or "out of  stock" in card_text:
-                stock = "❌ out of stock"
-            else:
-                stock = "✅ in stock"
-
-        print(f"    • {name} — {stock}")
-
-    if not in_stock_items:
-        sangam_found = any(
-            "sangam" in link.get_text(strip=True).lower() or "mgss 05" in link.get_text(strip=True).lower()
-            for link in all_links
-        )
-        if sangam_found:
-            print("\n  ❌ Sangam found on homepage but still out of stock.")
-        else:
-            print("\n  ℹ️  No Sangam MGSS 05 watches on homepage currently.")
-
-    return in_stock_items
+    return matches
 
 
 def send_telegram(message: str):
@@ -203,53 +168,53 @@ def send_telegram(message: str):
 
 def main():
     print("=" * 55)
-    print("HMT Stock Checker — running across 2 sites")
+    print("HMT Stock Checker — hmtwatches.store")
     print("=" * 55)
 
     any_in_stock = False
 
-    # ── hmtwatches.store ──────────────────────────────────────
-    print("\n📦 hmtwatches.store — checking 3 variants")
-    print("-" * 55)
     for product in STORE_PRODUCTS:
-        print(f"\n  {product['name']}")
+        print(f"\n  Checking: {product['name']}")
+        print(f"  URL: {product['url']}")
         try:
             in_stock, buy_url = check_store_product(product)
             if in_stock:
                 any_in_stock = True
+                print("  ✅ IN STOCK — sending Telegram alert!")
                 send_telegram(
                     f"🎉 <b>{product['name']} is back in stock!</b>\n\n"
                     f"Buy it now before it sells out:\n"
                     f'<a href="{buy_url}">{buy_url}</a>'
                 )
             else:
-                print(f"  ❌ Still out of stock.")
+                print("  ❌ Still out of stock.")
         except Exception as e:
             print(f"  ⚠️  Error: {e}")
 
-    # ── hmtwatches.in ─────────────────────────────────────────
-    print("\n\n🔍 hmtwatches.in — checking homepage Newly Listed section")
+    # ── Reddit ────────────────────────────────────────────────
+    print("\n\n💬 r/hmtwatches — checking for Sangam mentions")
     print("-" * 55)
     try:
-        in_stock_items = check_official_site()
-        if in_stock_items:
+        reddit_matches = check_reddit()
+        if reddit_matches:
             any_in_stock = True
-            for name, url in in_stock_items:
+            for title, permalink, _ in reddit_matches:
+                print(f"  ✅ New post matched — alerting!")
                 send_telegram(
-                    f"🎉 <b>{name} is back in stock on hmtwatches.in!</b>\n\n"
-                    f"Buy it now before it sells out:\n"
-                    f'<a href="{url}">{url}</a>'
+                    f"💬 <b>New Sangam mention on r/hmtwatches!</b>\n\n"
+                    f"<b>{title}</b>\n\n"
+                    f'<a href="{permalink}">{permalink}</a>'
                 )
         else:
-            print("  ❌ No Sangam watches found in stock on homepage.")
+            print("  ℹ️  No new Sangam posts found.")
     except Exception as e:
-        print(f"  ⚠️  Error: {e}")
+        print(f"  ⚠️  Reddit check error: {e}")
 
     print("\n" + "=" * 55)
     if any_in_stock:
         print("🔔 Telegram alert(s) sent.")
     else:
-        print("No stock changes. Will check again in 5 minutes.")
+        print("No stock changes. Will check again later.")
     print("=" * 55)
 
 
