@@ -30,8 +30,9 @@ STORE_PRODUCTS = [
     },
 ]
 
-# Single search on hmtwatches.in that returns ALL colour variants at once
-OFFICIAL_SEARCH_URL = "https://www.hmtwatches.in/search_products?keys=HMT+Sangam+MGSS+05"
+# hmtwatches.in homepage — Newly Listed section is server-side rendered
+# If a Sangam watch is restocked it appears here before anywhere else
+OFFICIAL_HOME_URL = "https://www.hmtwatches.in/"
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
@@ -88,32 +89,31 @@ def check_store_product(product: dict) -> tuple[bool, str]:
 
 def check_official_site() -> list[tuple[str, str]]:
     """
-    Fetches the single search page that returns all 6 MGSS 05 variants.
-    Returns a list of (product_name, product_url) for any that are IN STOCK.
+    Checks the hmtwatches.in homepage Newly Listed section.
+    This section is fully server-rendered — no JS needed.
+    If any Sangam MGSS 05 watch appears here without Out of Stock label,
+    it means it just got restocked.
     """
-    resp = requests.get(OFFICIAL_SEARCH_URL, headers=HEADERS, timeout=20)
+    resp = requests.get(OFFICIAL_HOME_URL, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Verify results loaded
-    page_text = soup.get_text(separator=" ")
-    import re
-    match = re.search(r"(\d+)\s+Results", page_text)
-    result_count = match.group(1) if match else "?"
-    print(f"  [official] Search returned {result_count} result(s)")
-
-    in_stock_items = []
-
-    # Each product card is an <a> tag linking to product_overview
-    # The card contains the product name and stock status as text
+    # Find all product links on the homepage
     all_links = soup.find_all("a", href=lambda h: h and "product_overview" in h)
 
+    if not all_links:
+        print(f"  [official] No product links found on homepage — skipping safely")
+        return []
+
+    print(f"  [official] Homepage loaded with {len(all_links)} product card(s) ✓")
+
+    in_stock_items = []
     seen_urls = set()
+
     for link in all_links:
         product_url = link["href"]
         if not product_url.startswith("http"):
             product_url = "https://www.hmtwatches.in" + product_url
-
         if product_url in seen_urls:
             continue
         seen_urls.add(product_url)
@@ -122,13 +122,16 @@ def check_official_site() -> list[tuple[str, str]]:
         if not product_name:
             continue
 
+        # Only care about Sangam MGSS 05 watches
+        if "sangam" not in product_name.lower() and "mgss 05" not in product_name.lower():
+            continue
+
         # Walk up to find the card container with stock info
         card = link.find_parent()
         for _ in range(6):
             if card is None:
                 break
-            card_text = card.get_text(separator=" ").lower()
-            if len(card_text) > 80:
+            if len(card.get_text(separator=" ")) > 80:
                 break
             card = card.find_parent()
 
@@ -141,8 +144,19 @@ def check_official_site() -> list[tuple[str, str]]:
         if is_oos:
             print(f"    → {product_name}: out of stock")
         else:
-            print(f"    → {product_name}: ✅ IN STOCK!")
+            print(f"    → {product_name}: ✅ IN STOCK (appeared on homepage)!")
             in_stock_items.append((product_name, product_url))
+
+    if not in_stock_items:
+        # Check if any Sangam watches appeared at all (even OOS)
+        sangam_found = any(
+            "sangam" in link.get_text(strip=True).lower() or "mgss 05" in link.get_text(strip=True).lower()
+            for link in all_links
+        )
+        if sangam_found:
+            print(f"  ❌ Sangam watches on homepage but still out of stock.")
+        else:
+            print(f"  ℹ️  No Sangam MGSS 05 watches on homepage currently.")
 
     return in_stock_items
 
