@@ -147,16 +147,45 @@ def check_official_site() -> list[tuple[str, str]]:
             print(f"    → {product_name}: ✅ IN STOCK (appeared on homepage)!")
             in_stock_items.append((product_name, product_url))
 
+    # ── Log ALL watches currently shown on homepage ──────────────
+    print(f"
+  📋 All watches currently on homepage:")
+    logged = set()
+    for link in all_links:
+        name = link.get_text(strip=True)
+        if not name or name in logged:
+            continue
+        logged.add(name)
+
+        card = link.find_parent()
+        for _ in range(6):
+            if card is None:
+                break
+            if len(card.get_text(separator=" ")) > 80:
+                break
+            card = card.find_parent()
+
+        stock = "unknown"
+        if card:
+            card_text = card.get_text(separator=" ").lower()
+            if "out of stock" in card_text or "out of  stock" in card_text:
+                stock = "❌ out of stock"
+            else:
+                stock = "✅ in stock"
+
+        print(f"    • {name} — {stock}")
+
     if not in_stock_items:
-        # Check if any Sangam watches appeared at all (even OOS)
         sangam_found = any(
             "sangam" in link.get_text(strip=True).lower() or "mgss 05" in link.get_text(strip=True).lower()
             for link in all_links
         )
         if sangam_found:
-            print(f"  ❌ Sangam watches on homepage but still out of stock.")
+            print(f"
+  ❌ Sangam found on homepage but still out of stock.")
         else:
-            print(f"  ℹ️  No Sangam MGSS 05 watches on homepage currently.")
+            print(f"
+  ℹ️  No Sangam MGSS 05 watches on homepage currently.")
 
     return in_stock_items
 
@@ -201,7 +230,7 @@ def main():
             print(f"  ⚠️  Error: {e}")
 
     # ── hmtwatches.in ─────────────────────────────────────────
-    print("\n\n🔍 hmtwatches.in — searching all MGSS 05 variants")
+    print("\n\n🔍 hmtwatches.in — checking homepage Newly Listed section")
     print("-" * 55)
     try:
         in_stock_items = check_official_site()
@@ -214,7 +243,7 @@ def main():
                     f'<a href="{url}">{url}</a>'
                 )
         else:
-            print("  ❌ All variants still out of stock.")
+            print("  ❌ No Sangam watches found in stock on homepage.")
     except Exception as e:
         print(f"  ⚠️  Error: {e}")
 
