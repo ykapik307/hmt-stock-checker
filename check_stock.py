@@ -1,30 +1,37 @@
 """
 HMT Watch Stock Checker
-Monitors the HMT Sangam MGSS 05 across TWO HMT websites and sends
-a Telegram alert the moment it becomes available on either.
+Monitors HMT Sangam MGSS 05 variants across TWO websites and sends
+a Telegram alert the moment any variant becomes available.
+
+hmtwatches.store → direct product page per colour variant
+hmtwatches.in   → one search query returning all 6 variants at once
 """
 
 import os
+import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
-PRODUCTS = [
+
+# Direct product pages on hmtwatches.store
+STORE_PRODUCTS = [
     {
-        "name": "HMT Sangam MGSS 05 (hmtwatches.store)",
+        "name": "HMT Sangam MGSS 05 Maroon — hmtwatches.store",
         "url": "https://www.hmtwatches.store/product/92eec23b-13cd-4191-afab-2cc0ddd8722f",
-        "site": "store",
     },
     {
-        "name": "HMT Sangam MGSS 05 (hmtwatches.in)",
-        # hmtwatches.in uses session-based URLs that expire, so we scan
-        # the full listing page and search for the model name instead.
-        "url": "https://www.hmtwatches.in/watches",
-        "site": "official",
+        "name": "HMT Sangam MGSS 05 Grey — hmtwatches.store",
+        "url": "https://www.hmtwatches.store/product/0ac2f002-7d19-49a9-a8b6-7edf5650a8c6",
+    },
+    {
+        "name": "HMT Sangam MGSS 05 Blue — hmtwatches.store",
+        "url": "https://www.hmtwatches.store/product/03c72bca-7137-4e09-9fdb-d953ee8261f1",
     },
 ]
 
-SEARCH_MODEL = "MGSS 05"
+# Single search on hmtwatches.in that returns ALL colour variants at once
+OFFICIAL_SEARCH_URL = "https://www.hmtwatches.in/search_products?keys=HMT+Sangam+MGSS+05"
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
@@ -39,124 +46,105 @@ HEADERS = {
 }
 
 
-def check_store_site(product: dict) -> tuple[bool, str]:
+def check_store_product(product: dict) -> tuple[bool, str]:
     """
-    Checks hmtwatches.store product page.
-
-    The page structure when OUT OF STOCK:
-      <product section>  →  "Out of Stock"  (no Add to Cart button here)
-      <you may also like> → "ADD TO CART" / "BUY NOW" for OTHER products
-
-    Fix: only look at the product detail section, not the whole page.
-    We find "Out of Stock" near the price, and only trust "Add to Cart"
-    if it appears in that same section — not in "You May Also Like".
+    Checks a hmtwatches.store product page directly.
+    Only reads the product section — ignores 'You May Also Like' cards.
     """
     resp = requests.get(product["url"], headers=HEADERS, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Strategy: find the price element (₹2765) — the stock status
-    # is always nearby. Then check only that local section.
-    in_stock = False
-
-    # Look for the "Out of Stock" text that sits right next to the price
-    # The page shows it as plain text directly under the price/colour row.
-    out_of_stock_tags = soup.find_all(
-        string=lambda t: t and "out of stock" in t.strip().lower()
-    )
-
-    # Filter to tags that are NOT inside "You May Also Like" section
-    relevant_oos = []
-    for tag in out_of_stock_tags:
-        # Walk up and check if any ancestor contains "you may also like"
-        in_recommendations = False
+    def in_recommendations(tag):
         parent = tag.find_parent()
         for _ in range(10):
             if parent is None:
-                break
+                return False
             txt = parent.get_text(separator=" ").lower()
             if "you may also like" in txt and len(txt) > 500:
-                in_recommendations = True
-                break
+                return True
             parent = parent.find_parent()
-        if not in_recommendations:
-            relevant_oos.append(tag)
+        return False
 
-    if relevant_oos:
-        # "Out of Stock" found in the product section itself
-        print(f"  [store]    'Out of Stock' found in product section → out of stock")
+    oos_tags = [
+        t for t in soup.find_all(string=lambda t: t and "out of stock" in t.strip().lower())
+        if not in_recommendations(t)
+    ]
+    if oos_tags:
+        print(f"  [store] 'Out of Stock' found → out of stock")
         return False, product["url"]
 
-    # No "Out of Stock" in the product section — now check for Add to Cart
-    # but again, only in the product section (not recommendations)
-    add_to_cart_tags = soup.find_all(
-        string=lambda t: t and "add to cart" in t.strip().lower()
-    )
-    relevant_atc = []
-    for tag in add_to_cart_tags:
-        in_recommendations = False
-        parent = tag.find_parent()
-        for _ in range(10):
-            if parent is None:
-                break
-            txt = parent.get_text(separator=" ").lower()
-            if "you may also like" in txt and len(txt) > 500:
-                in_recommendations = True
-                break
-            parent = parent.find_parent()
-        if not in_recommendations:
-            relevant_atc.append(tag)
+    atc_tags = [
+        t for t in soup.find_all(string=lambda t: t and "add to cart" in t.strip().lower())
+        if not in_recommendations(t)
+    ]
+    if atc_tags:
+        print(f"  [store] 'Add to Cart' found → IN STOCK!")
+        return True, product["url"]
 
-    if relevant_atc:
-        print(f"  [store]    'Add to Cart' found in product section → IN STOCK")
-        in_stock = True
-    else:
-        # Neither out-of-stock nor add-to-cart in product section
-        # Treat as still out of stock (safer default)
-        print(f"  [store]    No clear stock signal in product section → assuming out of stock")
-        in_stock = False
-
-    return in_stock, product["url"]
+    print(f"  [store] No clear stock signal → assuming out of stock")
+    return False, product["url"]
 
 
-def check_official_site(product: dict) -> tuple[bool, str]:
+def check_official_site() -> list[tuple[str, str]]:
     """
-    Checks hmtwatches.in listing page for the model name.
-    Looks for the product card and checks its stock status.
+    Fetches the single search page that returns all 6 MGSS 05 variants.
+    Returns a list of (product_name, product_url) for any that are IN STOCK.
     """
-    resp = requests.get(product["url"], headers=HEADERS, timeout=20)
+    resp = requests.get(OFFICIAL_SEARCH_URL, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    model_tag = soup.find(string=lambda t: t and SEARCH_MODEL.lower() in t.lower())
+    # Verify results loaded
+    page_text = soup.get_text(separator=" ")
+    import re
+    match = re.search(r"(\d+)\s+Results", page_text)
+    result_count = match.group(1) if match else "?"
+    print(f"  [official] Search returned {result_count} result(s)")
 
-    if not model_tag:
-        print(f"  [official] '{SEARCH_MODEL}' not found on listing page → out of stock")
-        return False, "https://www.hmtwatches.in/watches"
+    in_stock_items = []
 
-    # Walk up to find the product card and check stock status within it
-    parent = model_tag.find_parent()
-    for _ in range(8):
-        if parent is None:
-            break
-        card_text = parent.get_text(separator=" ").lower()
-        if "out of stock" in card_text:
-            print(f"  [official] '{SEARCH_MODEL}' found but marked out of stock")
-            return False, "https://www.hmtwatches.in/watches"
-        if "add to cart" in card_text or "buy now" in card_text:
-            print(f"  [official] '{SEARCH_MODEL}' found and appears available!")
-            return True, "https://www.hmtwatches.in/watches"
-        parent = parent.find_parent()
+    # Each product card is an <a> tag linking to product_overview
+    # The card contains the product name and stock status as text
+    all_links = soup.find_all("a", href=lambda h: h and "product_overview" in h)
 
-    print(f"  [official] '{SEARCH_MODEL}' found but stock status unclear → assuming out of stock")
-    return False, "https://www.hmtwatches.in/watches"
+    seen_urls = set()
+    for link in all_links:
+        product_url = link["href"]
+        if not product_url.startswith("http"):
+            product_url = "https://www.hmtwatches.in" + product_url
 
+        if product_url in seen_urls:
+            continue
+        seen_urls.add(product_url)
 
-def check_product(product: dict) -> tuple[bool, str]:
-    if product["site"] == "store":
-        return check_store_site(product)
-    else:
-        return check_official_site(product)
+        product_name = link.get_text(strip=True)
+        if not product_name:
+            continue
+
+        # Walk up to find the card container with stock info
+        card = link.find_parent()
+        for _ in range(6):
+            if card is None:
+                break
+            card_text = card.get_text(separator=" ").lower()
+            if len(card_text) > 80:
+                break
+            card = card.find_parent()
+
+        if card is None:
+            continue
+
+        card_text = card.get_text(separator=" ").lower()
+        is_oos = "out of stock" in card_text or "out of  stock" in card_text
+
+        if is_oos:
+            print(f"    → {product_name}: out of stock")
+        else:
+            print(f"    → {product_name}: ✅ IN STOCK!")
+            in_stock_items.append((product_name, product_url))
+
+    return in_stock_items
 
 
 def send_telegram(message: str):
@@ -169,7 +157,7 @@ def send_telegram(message: str):
     }
     r = requests.post(url, json=payload, timeout=15)
     r.raise_for_status()
-    print("[telegram] alert sent ✓")
+    print("  [telegram] alert sent ✓")
 
 
 def main():
@@ -179,13 +167,15 @@ def main():
 
     any_in_stock = False
 
-    for product in PRODUCTS:
-        print(f"\nChecking: {product['name']}")
+    # ── hmtwatches.store ──────────────────────────────────────
+    print("\n📦 hmtwatches.store — checking 3 variants")
+    print("-" * 55)
+    for product in STORE_PRODUCTS:
+        print(f"\n  {product['name']}")
         try:
-            in_stock, buy_url = check_product(product)
+            in_stock, buy_url = check_store_product(product)
             if in_stock:
                 any_in_stock = True
-                print(f"  ✅ IN STOCK → alerting!")
                 send_telegram(
                     f"🎉 <b>{product['name']} is back in stock!</b>\n\n"
                     f"Buy it now before it sells out:\n"
@@ -194,11 +184,29 @@ def main():
             else:
                 print(f"  ❌ Still out of stock.")
         except Exception as e:
-            print(f"  ⚠️  Error checking {product['name']}: {e}")
+            print(f"  ⚠️  Error: {e}")
+
+    # ── hmtwatches.in ─────────────────────────────────────────
+    print("\n\n🔍 hmtwatches.in — searching all MGSS 05 variants")
+    print("-" * 55)
+    try:
+        in_stock_items = check_official_site()
+        if in_stock_items:
+            any_in_stock = True
+            for name, url in in_stock_items:
+                send_telegram(
+                    f"🎉 <b>{name} is back in stock on hmtwatches.in!</b>\n\n"
+                    f"Buy it now before it sells out:\n"
+                    f'<a href="{url}">{url}</a>'
+                )
+        else:
+            print("  ❌ All variants still out of stock.")
+    except Exception as e:
+        print(f"  ⚠️  Error: {e}")
 
     print("\n" + "=" * 55)
     if any_in_stock:
-        print("🔔 Telegram alert sent.")
+        print("🔔 Telegram alert(s) sent.")
     else:
         print("No stock changes. Will check again in 5 minutes.")
     print("=" * 55)
