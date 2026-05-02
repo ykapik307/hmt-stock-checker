@@ -148,8 +148,8 @@ def check_official_site() -> list[tuple[str, str]]:
             in_stock_items.append((product_name, product_url))
 
     # ── Log ALL watches currently shown on homepage ──────────────
-    print(f"
-  📋 All watches currently on homepage:")
+    print("")
+    print("  📋 All watches currently on homepage:")
     logged = set()
     for link in all_links:
         name = link.get_text(strip=True)
@@ -181,11 +181,9 @@ def check_official_site() -> list[tuple[str, str]]:
             for link in all_links
         )
         if sangam_found:
-            print(f"
-  ❌ Sangam found on homepage but still out of stock.")
+            print("\n  ❌ Sangam found on homepage but still out of stock.")
         else:
-            print(f"
-  ℹ️  No Sangam MGSS 05 watches on homepage currently.")
+            print("\n  ℹ️  No Sangam MGSS 05 watches on homepage currently.")
 
     return in_stock_items
 
