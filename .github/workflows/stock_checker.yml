@@ -5,6 +5,9 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -33,9 +36,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Create the file if it doesn't exist yet (first run)
           touch seen_posts.txt
           git add seen_posts.txt
-          # Only commit if the file actually changed
           git diff --staged --quiet || git commit -m "chore: update seen_posts [skip ci]"
           git push
